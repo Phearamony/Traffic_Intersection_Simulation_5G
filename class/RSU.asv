@@ -1,0 +1,524 @@
+classdef RSU<handle
+    properties(GetAccess=public)
+        ID=[];
+        
+        % V2X_data (received from vehicles)
+        v2x_data = struct();  % latest data per vehicle
+        str_v2x_data = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());        % permanent
+        str_v2x_data_short = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());  % temp
+
+        % X2V_data (sent to vehicles)
+        x2v_data = struct();  % latest data per vehicle
+        str_x2v_data = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());        % permanent
+        str_x2v_data_short = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());  % temp
+        
+        % Active vehicles tracking
+        active_vehicles = struct('N',[],'S',[],'E',[],'W',[]);  % list of active vehicle IDs per direction
+    end
+
+    properties
+        X=0; Y=0; 
+        SHORT_K = 20;           % keep last K entries in short storage
+        COMM_RANGE = 200;       % communication range in meters
+        INTERSECTION_RADIUS = 15;  % intersection zone radius
+    end
+
+    methods
+        function obj=RSU(ID, X, Y)
+            obj.ID=ID;
+            obj.Y=Y;
+            obj.X=X;
+        end
+    end
+
+    methods(Static)
+        %% Initialize vehicle history structure
+        function H = initVehHistory()
+            H = struct('t',[], 'X',[], 'Y',[], 'V',[], 'Ac',[], ...
+                       'TRight',[], 'TRighted',[], 'TLeft',[], 'TLefted',[]);
+        end
+
+        %% Initialize X2V history structure
+        function H = initX2VHistory()
+            H = struct('t',[], 'turn_signal',[], 'recommended_V',[], ...
+                       'recommended_Ac',[], 'priority',[], 'message',[]);
+        end
+
+        %% Trim to last K entries
+        function H = trimLastK(H, K)
+            fn = fieldnames(H);
+            for i = 1:numel(fn)
+                v = H.(fn{i});
+                if isnumeric(v)
+                    n = numel(v);
+                    if n > K
+                        H.(fn{i}) = v(n-K+1:n);
+                    end
+                elseif iscell(v)
+                    n = numel(v);
+                    if n > K
+                        H.(fn{i}) = v(n-K+1:n);
+                    end
+                end
+            end
+        end
+    end
+
+    methods
+        %% ==================== V2X RECEIVING ====================
+        
+        %% Receive data from vehicle to RSU
+        function ReceivingV2X(obj, data)
+            vehicleID = data.ID;
+            vfield = ['v', num2str(vehicleID)];
+            dir = upper(char(data.Dir));
+
+            % Store latest V2X data per vehicle
+            obj.v2x_data.(vfield) = data;
+
+            % Track active vehicle
+            if ~ismember(vehicleID, obj.active_vehicles.(dir))
+                obj.active_vehicles.(dir)(end+1) = vehicleID;
+            end
+
+            % Store in permanent history
+            obj.StoreV2XData(data);
+            
+            % Store in temp (short) history
+            obj.StoreV2XDataShort(data);
+        end
+
+        %% Store V2X data (permanent)
+        function StoreV2XData(obj, data)
+            dir = upper(char(data.Dir));
+            vfield = ['v', num2str(data.ID)];
+
+            % Initialize if doesn't exist
+            if ~isfield(obj.str_v2x_data.(dir), vfield)
+                obj.str_v2x_data.(dir).(vfield) = RSU.initVehHistory();
+            end
+            H = obj.str_v2x_data.(dir).(vfield);
+
+            % Append data
+            H.t(end+1) = data.t;
+            H.X(end+1) = data.X;
+            H.Y(end+1) = data.Y;
+            H.V(end+1) = data.V;
+            H.Ac(end+1) = data.Ac;
+            H.TRight(end+1) = double(data.TurnRight);
+            H.TRighted(end+1) = double(data.TurnedRight);
+            H.TLeft(end+1) = double(data.TurnLeft);
+            H.TLefted(end+1) = double(data.TurnedLeft);
+
+            obj.str_v2x_data.(dir).(vfield) = H;
+        end
+
+        %% Store V2X data (temp/short)
+        function StoreV2XDataShort(obj, data)
+            dir = upper(char(data.Dir));
+            vfield = ['v', num2str(data.ID)];
+
+            % Initialize if doesn't exist
+            if ~isfield(obj.str_v2x_data_short.(dir), vfield)
+                obj.str_v2x_data_short.(dir).(vfield) = RSU.initVehHistory();
+            end
+            Hs = obj.str_v2x_data_short.(dir).(vfield);
+
+            % Append data
+            Hs.t(end+1) = data.t;
+            Hs.X(end+1) = data.X;
+            Hs.Y(end+1) = data.Y;
+            Hs.V(end+1) = data.V;
+            Hs.Ac(end+1) = data.Ac;
+            Hs.TRight(end+1) = double(data.TurnRight);
+            Hs.TRighted(end+1) = double(data.TurnedRight);
+            Hs.TLeft(end+1) = double(data.TurnLeft);
+            Hs.TLefted(end+1) = double(data.TurnedLeft);
+
+            % Trim to last K
+            Hs = RSU.trimLastK(Hs, obj.SHORT_K);
+
+            obj.str_v2x_data_short.(dir).(vfield) = Hs;
+        end
+
+        %% Reset V2X short storage
+        function ResetV2XShort(obj)
+            obj.str_v2x_data_short = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());
+        end
+
+        %% Reset V2X short storage for specific direction
+        function ResetV2XShortDir(obj, dir)
+            obj.str_v2x_data_short.(upper(dir)) = struct();
+        end
+
+        %% ==================== X2V SENDING ====================
+        
+        %% Send data from RSU to specific vehicle
+        % Returns data packet that should be passed to Car.ReceivingX2V()
+        function data = SendingX2V(obj, t, vehicleID, turn_signal, recommended_V, recommended_Ac, priority, message)
+            vfield = ['v', num2str(vehicleID)];
+            
+            % Create data packet
+            data = struct(...
+                't', t, ...
+                'target_ID', vehicleID, ...
+                'turn_signal', turn_signal, ...
+                'recommended_V', recommended_V, ...
+                'recommended_Ac', recommended_Ac, ...
+                'priority', priority, ...
+                'message', message ...
+            );
+            
+            % Store latest X2V data per vehicle
+            obj.x2v_data.(vfield) = data;
+            
+            % Get direction from v2x_data if available
+            if isfield(obj.v2x_data, vfield) && isfield(obj.v2x_data.(vfield), 'Dir')
+                dir = upper(char(obj.v2x_data.(vfield).Dir));
+                
+                % Store in permanent history
+                obj.StoreX2VData(dir, vehicleID, data);
+                
+                % Store in temp (short) history
+                obj.StoreX2VDataShort(dir, vehicleID, data);
+            end
+        end
+
+        %% Store X2V data (permanent)
+        function StoreX2VData(obj, dir, vehicleID, data)
+            vfield = ['v', num2str(vehicleID)];
+
+            % Initialize if doesn't exist
+            if ~isfield(obj.str_x2v_data.(dir), vfield)
+                obj.str_x2v_data.(dir).(vfield) = RSU.initX2VHistory();
+            end
+            H = obj.str_x2v_data.(dir).(vfield);
+
+            % Append data
+            H.t(end+1) = data.t;
+            H.turn_signal(end+1) = data.turn_signal;
+            H.recommended_V(end+1) = data.recommended_V;
+            H.recommended_Ac(end+1) = data.recommended_Ac;
+            H.priority(end+1) = data.priority;
+            H.message{end+1} = data.message;
+
+            obj.str_x2v_data.(dir).(vfield) = H;
+        end
+
+        %% Store X2V data (temp/short)
+        function StoreX2VDataShort(obj, dir, vehicleID, data)
+            vfield = ['v', num2str(vehicleID)];
+
+            % Initialize if doesn't exist
+            if ~isfield(obj.str_x2v_data_short.(dir), vfield)
+                obj.str_x2v_data_short.(dir).(vfield) = RSU.initX2VHistory();
+            end
+            Hs = obj.str_x2v_data_short.(dir).(vfield);
+
+            % Append data
+            Hs.t(end+1) = data.t;
+            Hs.turn_signal(end+1) = data.turn_signal;
+            Hs.recommended_V(end+1) = data.recommended_V;
+            Hs.recommended_Ac(end+1) = data.recommended_Ac;
+            Hs.priority(end+1) = data.priority;
+            Hs.message{end+1} = data.message;
+
+            % Trim to last K
+            Hs = RSU.trimLastK(Hs, obj.SHORT_K);
+
+            obj.str_x2v_data_short.(dir).(vfield) = Hs;
+        end
+
+        %% Reset X2V short storage
+        function ResetX2VShort(obj)
+            obj.str_x2v_data_short = struct('N',struct(),'S',struct(),'E',struct(),'W',struct());
+        end
+
+        %% Reset X2V short storage for specific direction
+        function ResetX2VShortDir(obj, dir)
+            obj.str_x2v_data_short.(upper(dir)) = struct();
+        end
+
+        %% Reset all short storage
+        function ResetAllShort(obj)
+            obj.ResetV2XShort();
+            obj.ResetX2VShort();
+        end
+
+        %% ==================== VEHICLE MANAGEMENT ====================
+        
+        %% Remove vehicle from tracking (when it leaves)
+        function RemoveVehicle(obj, vehicleID, dir)
+            dir = upper(char(dir));
+            vfield = ['v', num2str(vehicleID)];
+            
+            % Remove from active list
+            obj.active_vehicles.(dir)(obj.active_vehicles.(dir) == vehicleID) = [];
+            
+            % Optionally clear short storage for this vehicle
+            if isfield(obj.str_v2x_data_short.(dir), vfield)
+                obj.str_v2x_data_short.(dir) = rmfield(obj.str_v2x_data_short.(dir), vfield);
+            end
+            if isfield(obj.str_x2v_data_short.(dir), vfield)
+                obj.str_x2v_data_short.(dir) = rmfield(obj.str_x2v_data_short.(dir), vfield);
+            end
+        end
+
+        %% Get all active vehicles in a direction
+        function ids = GetActiveVehicles(obj, dir)
+            ids = obj.active_vehicles.(upper(dir));
+        end
+
+        %% Get latest V2X data for a vehicle
+        function data = GetVehicleData(obj, vehicleID)
+            vfield = ['v', num2str(vehicleID)];
+            if isfield(obj.v2x_data, vfield)
+                data = obj.v2x_data.(vfield);
+            else
+                data = [];
+            end
+        end
+
+        %% Get vehicle history (permanent)
+        function H = GetVehicleHistory(obj, vehicleID, dir)
+            vfield = ['v', num2str(vehicleID)];
+            dir = upper(char(dir));
+            if isfield(obj.str_v2x_data.(dir), vfield)
+                H = obj.str_v2x_data.(dir).(vfield);
+            else
+                H = [];
+            end
+        end
+
+        %% Get vehicle history (short/temp)
+        function H = GetVehicleHistoryShort(obj, vehicleID, dir)
+            vfield = ['v', num2str(vehicleID)];
+            dir = upper(char(dir));
+            if isfield(obj.str_v2x_data_short.(dir), vfield)
+                H = obj.str_v2x_data_short.(dir).(vfield);
+            else
+                H = [];
+            end
+        end
+
+        %% ==================== OPTIMIZATION FUNCTIONS ====================
+        
+        %% Calculate Estimated Time of Arrival to intersection
+        function ETA = ArrivalTime(obj, vehicleID)
+            data = obj.GetVehicleData(vehicleID);
+            if isempty(data)
+                ETA = Inf;
+                return;
+            end
+            
+            % Distance to RSU (intersection center)
+            switch data.Dir
+                case 'N'
+                    dist = obj.Y - data.Y;
+                case 'S'
+                    dist = data.Y - obj.Y;
+                case 'E'
+                    dist = obj.X - data.X;
+                case 'W'
+                    dist = data.X - obj.X;
+                otherwise
+                    dist = Inf;
+            end
+            
+            if dist <= 0 || data.V <= 0
+                ETA = 0;
+            else
+                % Simple ETA assuming constant velocity
+                ETA = dist / data.V;
+            end
+        end
+
+        %% Calculate Free-flow Arrival Time (assumes no obstacles)
+        function FTA = FreeFlowArrivalTime(obj, vehicleID, Vd)
+            data = obj.GetVehicleData(vehicleID);
+            if isempty(data)
+                FTA = Inf;
+                return;
+            end
+            
+            if nargin < 3
+                Vd = 25;  % default desired velocity
+            end
+            
+            % Distance to RSU (intersection center)
+            switch data.Dir
+                case 'N'
+                    dist = obj.Y - data.Y;
+                case 'S'
+                    dist = data.Y - obj.Y;
+                case 'E'
+                    dist = obj.X - data.X;
+                case 'W'
+                    dist = data.X - obj.X;
+                otherwise
+                    dist = Inf;
+            end
+            
+            if dist <= 0
+                FTA = 0;
+            else
+                % Free-flow ETA at desired velocity
+                FTA = dist / Vd;
+            end
+        end
+
+        %% Right-turn optimization
+        % Returns recommended velocity profile for right-turning vehicle
+        function [vpos, turn_signal] = RightTurnOpt(obj, vehicleID, t)
+            data = obj.GetVehicleData(vehicleID);
+            vpos = [];
+            turn_signal = 0;
+            
+            if isempty(data)
+                return;
+            end
+            
+            % Check if vehicle wants to turn right
+            if ~data.TurnRight
+                return;
+            end
+            
+            % Get conflicting traffic (vehicles from the left that go straight)
+            conflicting_dir = obj.GetConflictingDirection(data.Dir, 'right');
+            conflicting_ids = obj.GetActiveVehicles(conflicting_dir);
+            
+            % Calculate safe gap
+            min_gap = 3.0;  % minimum time gap in seconds
+            
+            can_turn = true;
+            for i = 1:length(conflicting_ids)
+                conf_data = obj.GetVehicleData(conflicting_ids(i));
+                if ~isempty(conf_data) && ~conf_data.TurnRight && ~conf_data.TurnLeft
+                    % Straight-going vehicle from conflicting direction
+                    conf_ETA = obj.ArrivalTime(conflicting_ids(i));
+                    my_ETA = obj.ArrivalTime(vehicleID);
+                    
+                    if abs(conf_ETA - my_ETA) < min_gap
+                        can_turn = false;
+                        break;
+                    end
+                end
+            end
+            
+            if can_turn
+                turn_signal = 1;  % Signal to proceed with turn
+                vpos = struct('recommended_V', data.V, 'action', 'proceed');
+            else
+                turn_signal = -1;  % Signal to wait
+                vpos = struct('recommended_V', 0, 'action', 'wait');
+            end
+        end
+
+        %% Get conflicting direction for turn maneuver
+        function conf_dir = GetConflictingDirection(~, my_dir, turn_type)
+            % For right turn, conflict comes from the left
+            % For left turn, conflict comes from opposite and right
+            switch upper(my_dir)
+                case 'N'
+                    if strcmp(turn_type, 'right')
+                        conf_dir = 'W';
+                    else
+                        conf_dir = 'S';
+                    end
+                case 'S'
+                    if strcmp(turn_type, 'right')
+                        conf_dir = 'E';
+                    else
+                        conf_dir = 'N';
+                    end
+                case 'E'
+                    if strcmp(turn_type, 'right')
+                        conf_dir = 'N';
+                    else
+                        conf_dir = 'W';
+                    end
+                case 'W'
+                    if strcmp(turn_type, 'right')
+                        conf_dir = 'S';
+                    else
+                        conf_dir = 'E';
+                    end
+                otherwise
+                    conf_dir = 'N';
+            end
+        end
+
+        %% Process all vehicles and send X2V responses
+        % Call this in main loop to handle all communications
+        function ProcessAndRespond(obj, t, cars)
+            dirs = {'N', 'S', 'E', 'W'};
+            
+            for d = 1:length(dirs)
+                dir = dirs{d};
+                ids = obj.GetActiveVehicles(dir);
+                
+                for i = 1:length(ids)
+                    vid = ids(i);
+                    data = obj.GetVehicleData(vid);
+                    
+                    if isempty(data)
+                        continue;
+                    end
+                    
+                    % Default response
+                    turn_signal = 0;
+                    recommended_V = NaN;
+                    recommended_Ac = NaN;
+                    priority = 0;
+                    message = '';
+                    
+                    % Check for right turn optimization
+                    if data.TurnRight && ~data.TurnedRight
+                        [vpos, turn_signal] = obj.RightTurnOpt(vid, t);
+                        if ~isempty(vpos)
+                            recommended_V = vpos.recommended_V;
+                            message = vpos.action;
+                        end
+                    end
+                    
+                    % Send response
+                    x2v_packet = obj.SendingX2V(t, vid, turn_signal, recommended_V, recommended_Ac, priority, message);
+                    
+                    % Find and update the car object
+                    for c = 1:length(cars)
+                        if cars{c}.ID == vid
+                            cars{c}.ReceivingX2V(x2v_packet);
+                            break;
+                        end
+                    end
+                end
+            end
+        end
+
+        %% ==================== DEBUG / UTILITY ====================
+        
+        %% Print summary of all stored data
+        function PrintSummary(obj)
+            fprintf('=== RSU %d Summary ===\n', obj.ID);
+            fprintf('Position: (%.1f, %.1f)\n', obj.X, obj.Y);
+            
+            dirs = {'N', 'S', 'E', 'W'};
+            for d = 1:length(dirs)
+                dir = dirs{d};
+                ids = obj.active_vehicles.(dir);
+                fprintf('Direction %s: %d active vehicles\n', dir, length(ids));
+                
+                for i = 1:length(ids)
+                    vid = ids(i);
+                    vfield = ['v', num2str(vid)];
+                    
+                    if isfield(obj.str_v2x_data.(dir), vfield)
+                        H = obj.str_v2x_data.(dir).(vfield);
+                        fprintf('  Vehicle %d: %d records\n', vid, length(H.t));
+                    end
+                end
+            end
+            fprintf('=====================\n');
+        end
+    end
+end

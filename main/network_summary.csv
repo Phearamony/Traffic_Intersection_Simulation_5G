@@ -1,0 +1,10 @@
+Metric,Wired,WiFi
+Packets Sent,18914,22482
+Packets Lost,0,1
+Packet Loss (%),%.2f,%.2f
+Mean Latency (ms),19.88,19.57
+Min Latency (ms),11.48,11.61
+Max Latency (ms),35.93,53.59
+Median Latency (ms),16.74,16.45
+Std Deviation (ms),5.64,5.65
+95th Percentile (ms),31.09,30.96
