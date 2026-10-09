@@ -6,7 +6,7 @@ coordination system out of an ideal, zero-latency simulation and **test it over 
 ultimately the Magna Wireless 5G network.
 
 📄 The method itself is described in the paper
-[Learning-Based Optimal Right-Turn Coordination System for Connected and Automated Vehicles at Intersections](https://github.com/Phearamony/Traffic_Intersection_Simulation/blob/main/paper/Phan_SICE2026_Right-Turn_Coordination.pdf)
+[Learning-Based Optimal Right-Turn Coordination System for Connected and Automated Vehicles at Intersections](https://drive.google.com/file/d/1eD-5lxTvvwlGY6lJCwVpVNrC4kos1YCi/view?usp=sharing)
 (SICE Festival 2026, Yokohama).
 
 ![Network latency comparison](main/figure1_overall_comparison.png)
